@@ -4,6 +4,8 @@
 
 #include "flutter/shell/platform/linux/fl_view_renderer_subsurface.h"
 
+#include <cstdlib>
+
 #include <epoxy/gl.h>
 #include <gdk/gdkwayland.h>
 
@@ -64,6 +66,37 @@ struct _FlViewRendererSubsurface {
   GdkFrameClock* frame_clock;
   gulong after_paint_handler;
 };
+
+// EXPERIMENT (hz): raster-thread timing of present_layers, printed every 60
+// frames when FLUTTER_LINUX_PRESENT_STATS=1.
+static void hz_present_timing(gint64 composite_us,
+                              gint64 total_us,
+                              size_t width,
+                              size_t height) {
+  static const gboolean enabled =
+      g_strcmp0(g_getenv("FLUTTER_LINUX_PRESENT_STATS"), "1") == 0;
+  if (!enabled) {
+    return;
+  }
+  static gint64 comp[60], tot[60];
+  static int n = 0;
+  comp[n] = composite_us;
+  tot[n] = total_us;
+  if (++n < 60) {
+    return;
+  }
+  n = 0;
+  auto cmp = [](const void* a, const void* b) {
+    gint64 x = *static_cast<const gint64*>(a), y = *static_cast<const gint64*>(b);
+    return x < y ? -1 : (x > y ? 1 : 0);
+  };
+  qsort(comp, 60, sizeof(gint64), cmp);
+  qsort(tot, 60, sizeof(gint64), cmp);
+  g_message("[hz] raster present %zux%zu: composite p50 %.2f / p90 %.2f ms | "
+            "total p50 %.2f / p90 %.2f / max %.2f ms",
+            width, height, comp[30] / 1000.0, comp[54] / 1000.0,
+            tot[30] / 1000.0, tot[54] / 1000.0, tot[59] / 1000.0);
+}
 
 G_DEFINE_TYPE(FlViewRendererSubsurface,
               fl_view_renderer_subsurface,
@@ -455,6 +488,7 @@ static void fl_view_renderer_subsurface_present_layers(
     const FlutterLayer** layers,
     size_t layers_count) {
   FlViewRendererSubsurface* self = FL_VIEW_RENDERER_SUBSURFACE(renderer);
+  gint64 hz_t0 = g_get_monotonic_time();  // EXPERIMENT (hz)
 
   g_mutex_lock(&self->frame_mutex);
 
@@ -515,6 +549,7 @@ static void fl_view_renderer_subsurface_present_layers(
   // before the other context uses it - making a context current only flushes
   // the previous one, which guarantees the commands have been submitted, not
   // that they have finished.
+  gint64 hz_t1 = g_get_monotonic_time();  // EXPERIMENT (hz)
   g_autoptr(FlGLFence) fence = nullptr;
   if (fl_compositor_opengl_can_fence(self->compositor)) {
     fence = fl_gl_fence_new(fl_engine_get_opengl_manager(self->engine));
@@ -533,6 +568,8 @@ static void fl_view_renderer_subsurface_present_layers(
   }
 
   g_mutex_unlock(&self->frame_mutex);
+  hz_present_timing(hz_t1 - hz_t0, g_get_monotonic_time() - hz_t0, width,
+                    height);  // EXPERIMENT (hz)
 
   // Wake up the GTK thread if it is blocked in size_allocate waiting for this
   // frame.

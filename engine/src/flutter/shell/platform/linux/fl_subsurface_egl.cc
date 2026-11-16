@@ -11,6 +11,229 @@
 
 #include "flutter/shell/platform/linux/fl_compositor_opengl_shader.h"
 
+// EXPERIMENT (hz): presentation-time feedback statistics.
+#include <gdk/gdkwayland.h>
+#include <algorithm>
+#include <ctime>
+#include <vector>
+#include "flutter/shell/platform/linux/hz_presentation_time.h"
+
+// EXPERIMENT (hz): with FLUTTER_LINUX_PRESENT_STATS=1, ask the compositor for
+// wp_presentation feedback on every frame presented to the subsurface and
+// print what actually reached the display every 240 presented frames:
+//   shown/s     frames the compositor reports as presented, per second
+//   discarded   frames committed but replaced before being shown
+//   msc Δ       vblank-counter step between consecutive shown frames
+//               (1 = a new frame on every refresh, 2 = one refresh repeated)
+//   gap         time between consecutive shown frames
+//   latency     eglSwapBuffers -> scanout
+// Feedback objects live on a private event queue that is dispatched from the
+// raster thread at each present, so no callbacks run on the GTK thread.
+namespace {
+
+struct HzPresentStats {
+  struct wl_display* display = nullptr;
+  struct wl_event_queue* queue = nullptr;
+  struct wp_presentation* presentation = nullptr;
+  uint32_t clock_id = CLOCK_MONOTONIC;
+
+  gint64 window_start_us = 0;
+  int shown = 0;
+  int discarded = 0;
+  int msc_step[4] = {0, 0, 0, 0};  // 1, 2, 3, 4+
+  uint32_t flags_all = ~0u;
+  uint32_t flags_any = 0;
+  uint32_t refresh_ns = 0;
+  bool have_last = false;
+  uint64_t last_msc = 0;
+  int64_t last_ns = 0;
+  std::vector<double> gaps_ms;
+  std::vector<double> latency_ms;
+};
+
+HzPresentStats* hz_present_stats() {
+  static HzPresentStats* stats = nullptr;
+  static bool initialized = false;
+  if (initialized) {
+    return stats;
+  }
+  initialized = true;
+  if (g_strcmp0(g_getenv("FLUTTER_LINUX_PRESENT_STATS"), "1") != 0) {
+    return nullptr;
+  }
+  GdkDisplay* gdk_display = gdk_display_get_default();
+  if (gdk_display == nullptr || !GDK_IS_WAYLAND_DISPLAY(gdk_display)) {
+    return nullptr;
+  }
+  stats = new HzPresentStats();
+  stats->display = gdk_wayland_display_get_wl_display(gdk_display);
+  return stats;
+}
+
+int64_t hz_now_ns(clockid_t clock) {
+  struct timespec ts;
+  clock_gettime(clock, &ts);
+  return static_cast<int64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
+}
+
+double hz_pct(std::vector<double>& v, double q) {
+  if (v.empty()) {
+    return 0;
+  }
+  std::sort(v.begin(), v.end());
+  return v[static_cast<size_t>((v.size() - 1) * q)];
+}
+
+void hz_maybe_report(HzPresentStats* s) {
+  if (s->shown < 60) {
+    return;
+  }
+  gint64 now = g_get_monotonic_time();
+  double secs = (now - s->window_start_us) / 1e6;
+  g_message(
+      "[hz] present: shown/s %.1f | discarded %d | msc Δ 1:%d 2:%d 3:%d 4+:%d | "
+      "gap p10 %.2f / p50 %.2f / p90 %.2f ms | latency p50 %.2f / p90 %.2f ms "
+      "| refresh %.3f ms | flags all 0x%x any 0x%x",
+      s->shown / secs, s->discarded, s->msc_step[0], s->msc_step[1],
+      s->msc_step[2], s->msc_step[3], hz_pct(s->gaps_ms, .1),
+      hz_pct(s->gaps_ms, .5), hz_pct(s->gaps_ms, .9),
+      hz_pct(s->latency_ms, .5), hz_pct(s->latency_ms, .9),
+      s->refresh_ns / 1e6, s->flags_all, s->flags_any);
+  s->window_start_us = now;
+  s->shown = 0;
+  s->discarded = 0;
+  for (int& c : s->msc_step) {
+    c = 0;
+  }
+  s->flags_all = ~0u;
+  s->flags_any = 0;
+  s->gaps_ms.clear();
+  s->latency_ms.clear();
+}
+
+struct HzFeedback {
+  HzPresentStats* stats;
+  int64_t swap_ns;
+};
+
+void hz_feedback_sync_output(void*,
+                             struct wp_presentation_feedback*,
+                             struct wl_output*) {}
+
+void hz_feedback_presented(void* data,
+                           struct wp_presentation_feedback* feedback,
+                           uint32_t tv_sec_hi,
+                           uint32_t tv_sec_lo,
+                           uint32_t tv_nsec,
+                           uint32_t refresh,
+                           uint32_t seq_hi,
+                           uint32_t seq_lo,
+                           uint32_t flags) {
+  HzFeedback* fb = static_cast<HzFeedback*>(data);
+  HzPresentStats* s = fb->stats;
+  int64_t t = static_cast<int64_t>((static_cast<uint64_t>(tv_sec_hi) << 32) |
+                                   tv_sec_lo) *
+                  1000000000 +
+              tv_nsec;
+  uint64_t msc = (static_cast<uint64_t>(seq_hi) << 32) | seq_lo;
+  if (s->have_last) {
+    s->gaps_ms.push_back((t - s->last_ns) / 1e6);
+    uint64_t step = msc - s->last_msc;
+    s->msc_step[step >= 4 ? 3 : (step == 0 ? 0 : step - 1)]++;
+  }
+  s->have_last = true;
+  s->last_ns = t;
+  s->last_msc = msc;
+  s->latency_ms.push_back((t - fb->swap_ns) / 1e6);
+  s->refresh_ns = refresh;
+  s->flags_all &= flags;
+  s->flags_any |= flags;
+  s->shown++;
+  wp_presentation_feedback_destroy(feedback);
+  delete fb;
+  hz_maybe_report(s);
+}
+
+void hz_feedback_discarded(void* data,
+                           struct wp_presentation_feedback* feedback) {
+  HzFeedback* fb = static_cast<HzFeedback*>(data);
+  fb->stats->discarded++;
+  wp_presentation_feedback_destroy(feedback);
+  delete fb;
+}
+
+const struct wp_presentation_feedback_listener hz_feedback_listener = {
+    hz_feedback_sync_output, hz_feedback_presented, hz_feedback_discarded};
+
+void hz_presentation_clock_id(void* data,
+                              struct wp_presentation*,
+                              uint32_t clk_id) {
+  static_cast<HzPresentStats*>(data)->clock_id = clk_id;
+}
+
+const struct wp_presentation_listener hz_presentation_listener = {
+    hz_presentation_clock_id};
+
+void hz_registry_global(void* data,
+                        struct wl_registry* registry,
+                        uint32_t name,
+                        const char* interface,
+                        uint32_t version) {
+  HzPresentStats* s = static_cast<HzPresentStats*>(data);
+  if (g_strcmp0(interface, "wp_presentation") == 0) {
+    s->presentation = static_cast<struct wp_presentation*>(wl_registry_bind(
+        registry, name, &hz_wp_presentation_interface, MIN(version, 1u)));
+    wp_presentation_add_listener(s->presentation, &hz_presentation_listener,
+                                 s);
+  }
+}
+
+void hz_registry_global_remove(void*, struct wl_registry*, uint32_t) {}
+
+const struct wl_registry_listener hz_registry_listener = {
+    hz_registry_global, hz_registry_global_remove};
+
+// Called on the raster thread before each eglSwapBuffers.
+void hz_present_begin(struct wl_surface* surface) {
+  HzPresentStats* s = hz_present_stats();
+  if (s == nullptr) {
+    return;
+  }
+  if (s->queue == nullptr) {
+    s->queue = wl_display_create_queue(s->display);
+    struct wl_display* wrapper =
+        static_cast<struct wl_display*>(wl_proxy_create_wrapper(s->display));
+    wl_proxy_set_queue(reinterpret_cast<struct wl_proxy*>(wrapper), s->queue);
+    struct wl_registry* registry = wl_display_get_registry(wrapper);
+    wl_proxy_wrapper_destroy(wrapper);
+    wl_registry_add_listener(registry, &hz_registry_listener, s);
+    wl_display_roundtrip_queue(s->display, s->queue);  // globals
+    wl_display_roundtrip_queue(s->display, s->queue);  // clock_id
+    g_message("[hz] presentation feedback %s (clock_id %u)",
+              s->presentation != nullptr ? "enabled" : "unavailable",
+              s->clock_id);
+    s->window_start_us = g_get_monotonic_time();
+  }
+  if (s->presentation == nullptr) {
+    return;
+  }
+  wl_display_dispatch_queue_pending(s->display, s->queue);
+
+  // Feedback must be requested before the commit made by eglSwapBuffers.
+  struct wl_surface* surface_wrapper =
+      static_cast<struct wl_surface*>(wl_proxy_create_wrapper(surface));
+  wl_proxy_set_queue(reinterpret_cast<struct wl_proxy*>(surface_wrapper),
+                     s->queue);
+  struct wp_presentation_feedback* feedback =
+      wp_presentation_feedback(s->presentation, surface_wrapper);
+  wl_proxy_wrapper_destroy(surface_wrapper);
+  wp_presentation_feedback_add_listener(
+      feedback, &hz_feedback_listener,
+      new HzFeedback{s, hz_now_ns(static_cast<clockid_t>(s->clock_id))});
+}
+
+}  // namespace
+
 struct _FlSubsurfaceEGL {
   GObject parent_instance;
 
@@ -328,6 +551,7 @@ void fl_subsurface_egl_present(FlSubsurfaceEGL* self,
     glBindTexture(GL_TEXTURE_2D, texture_id);
     glDrawArrays(GL_TRIANGLES, 0, 6);
   }
+  hz_present_begin(fl_subsurface_get_surface(self->subsurface));  // EXPERIMENT
   eglSwapBuffers(egl_display, self->egl_surface);
   self->buffer_width = self->window_width;
   self->buffer_height = self->window_height;
