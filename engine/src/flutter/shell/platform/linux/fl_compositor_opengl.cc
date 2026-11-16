@@ -122,8 +122,10 @@ void fl_compositor_opengl_composite_layers(FlCompositorOpenGL* self,
   glGenVertexArrays(1, &vao);
   glBindVertexArray(vao);
 
+  // The layers have premultiplied alpha, so blend them with "source over" for
+  // premultiplied colors.
   glEnable(GL_BLEND);
-  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 
   fl_compositor_opengl_shader_use(self->shader);
 

@@ -501,6 +501,12 @@ static void _glBindTexture(GLenum target, GLuint texture) {
   }
 }
 
+static void _glBlendFunc(GLenum sfactor, GLenum dfactor) {
+  if (mock) {
+    mock->glBlendFunc(sfactor, dfactor);
+  }
+}
+
 static void _glBlitFramebuffer(GLint srcX0,
                                GLint srcY0,
                                GLint srcX1,
@@ -878,6 +884,7 @@ void (*epoxy_glAttachShader)(GLuint program, GLuint shader);
 void (*epoxy_glBindFramebuffer)(GLenum target, GLuint framebuffer);
 void (*epoxy_glBindRenderbuffer)(GLenum target, GLuint renderbuffer);
 void (*epoxy_glBindTexture)(GLenum target, GLuint texture);
+void (*epoxy_glBlendFunc)(GLenum sfactor, GLenum dfactor);
 void (*epoxy_glBlitFramebuffer)(GLint srcX0,
                                 GLint srcY0,
                                 GLint srcX1,
@@ -988,6 +995,7 @@ static void library_init() {
   epoxy_glBindFramebuffer = _glBindFramebuffer;
   epoxy_glBindRenderbuffer = _glBindRenderbuffer;
   epoxy_glBindTexture = _glBindTexture;
+  epoxy_glBlendFunc = _glBlendFunc;
   epoxy_glBlitFramebuffer = _glBlitFramebuffer;
   epoxy_glCompileShader = _glCompileShader;
   epoxy_glClear = _glClear;

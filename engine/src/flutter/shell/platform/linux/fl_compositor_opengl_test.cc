@@ -296,6 +296,42 @@ TEST_F(FlCompositorOpenGLTest, BlitFramebufferNvidia) {
   }).join();
 }
 
+// Layers have premultiplied alpha. Blending them as straight alpha applies the
+// alpha twice, which draws translucent content too light.
+TEST_F(FlCompositorOpenGLTest, BlendsPremultipliedAlpha) {
+  constexpr size_t width = 100;
+  constexpr size_t height = 100;
+
+  // OpenGL 2.0, so the layer is drawn with the shader rather than blitted.
+  ON_CALL(epoxy, glGetString(GL_VENDOR))
+      .WillByDefault(
+          ::testing::Return(reinterpret_cast<const GLubyte*>("Intel")));
+  ON_CALL(epoxy, epoxy_is_desktop_gl).WillByDefault(::testing::Return(true));
+  EXPECT_CALL(epoxy, epoxy_gl_version).WillRepeatedly(::testing::Return(20));
+
+  EXPECT_CALL(epoxy, glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA));
+
+  compositor = fl_compositor_opengl_new(opengl_manager);
+
+  g_autoptr(FlFramebuffer) target =
+      fl_framebuffer_new(GL_RGBA, width, height, FALSE);
+  g_autoptr(FlFramebuffer) framebuffer =
+      fl_framebuffer_new(GL_RGBA, width, height, FALSE);
+  FlutterBackingStore backing_store = {
+      .type = kFlutterBackingStoreTypeOpenGL,
+      .open_gl = {.framebuffer = {.user_data = framebuffer}}};
+  FlutterLayer layer = {.type = kFlutterLayerContentTypeBackingStore,
+                        .backing_store = &backing_store,
+                        .offset = {0, 0},
+                        .size = {width, height}};
+  const FlutterLayer* layers[1] = {&layer};
+
+  std::thread([&]() {
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fl_framebuffer_get_id(target));
+    fl_compositor_opengl_composite_layers(compositor, layers, 1);
+  }).join();
+}
+
 // The frame must be composited into the format the engine rendered the layers
 // with. Deriving it from anything else (e.g. an extension check) produces an
 // empty frame, which showed up as a black window in the subsurface renderer.

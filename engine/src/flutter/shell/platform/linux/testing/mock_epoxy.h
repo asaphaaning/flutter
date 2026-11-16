@@ -35,6 +35,7 @@ class MockEpoxy {
   MOCK_METHOD(EGLint,
               eglWaitSyncKHR,
               (EGLDisplay dpy, EGLSyncKHR sync, EGLint flags));
+  MOCK_METHOD(void, glBlendFunc, (GLenum sfactor, GLenum dfactor));
   MOCK_METHOD(void, glClear, (GLbitfield mask));
   MOCK_METHOD(void, glClearColor, (GLfloat r, GLfloat g, GLfloat b, GLfloat a));
   MOCK_METHOD(void,
