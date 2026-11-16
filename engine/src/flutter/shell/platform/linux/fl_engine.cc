@@ -7,6 +7,9 @@
 #include <epoxy/egl.h>
 #include <gmodule.h>
 
+#include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstring>
 
 #include "flutter/common/constants.h"
@@ -34,6 +37,11 @@ static constexpr size_t kPlatformTaskRunnerIdentifier = 1;
 // differentiate the actual device (mouse v.s. trackpad)
 static constexpr int32_t kMousePointerDeviceId = 0;
 static constexpr int32_t kPointerPanZoomDeviceId = 1;
+
+static constexpr double kNanosecondsPerSecond = 1e9;
+
+// Time between frames when the display refresh rate isn't known (60 Hz).
+static constexpr uint64_t kDefaultFrameInterval = 16666667;
 
 struct _FlEngine {
   GObject parent_instance;
@@ -107,6 +115,10 @@ struct _FlEngine {
   FlEnginePlatformMessageHandler platform_message_handler;
   gpointer platform_message_handler_data;
   GDestroyNotify platform_message_handler_destroy_notify;
+
+  // Time between frames in nanoseconds, from the refresh rate of the fastest
+  // display. Written on the platform thread and read on the UI thread.
+  std::atomic<uint64_t> frame_interval;
 };
 
 G_DEFINE_QUARK(fl_engine_error_quark, fl_engine_error)
@@ -406,6 +418,21 @@ static bool compositor_present_view_callback(
   return true;
 }
 
+// Called when the engine is ready to draw the next frame.
+static void fl_engine_vsync_cb(void* user_data, intptr_t baton) {
+  FlEngine* self = static_cast<FlEngine*>(user_data);
+
+  // GTK doesn't report when the display refreshes, so start frames on a grid
+  // of the refresh interval. A start time in the future is fine: the engine
+  // waits until then before drawing.
+  uint64_t frame_interval = self->frame_interval;
+  uint64_t now = self->embedder_api.GetCurrentTime();
+  uint64_t frame_start =
+      (now + frame_interval - 1) / frame_interval * frame_interval;
+  self->embedder_api.OnVsync(self->engine, baton, frame_start,
+                             frame_start + frame_interval);
+}
+
 // Flutter engine rendering callbacks.
 
 static void* fl_engine_gl_proc_resolver(void* user_data, const char* name) {
@@ -669,6 +696,7 @@ static void fl_engine_init(FlEngine* self) {
 
   self->opengl_manager = fl_opengl_manager_new();
 
+  self->frame_interval = kDefaultFrameInterval;
   self->display_monitor =
       fl_display_monitor_new(self, gdk_display_get_default());
   self->task_runner = fl_task_runner_new(self);
@@ -890,6 +918,7 @@ gboolean fl_engine_start(FlEngine* self, GError** error) {
       compositor_collect_backing_store_callback;
   compositor.present_view_callback = compositor_present_view_callback;
   args.compositor = &compositor;
+  args.vsync_callback = fl_engine_vsync_cb;
 
   if (self->embedder_api.RunsAOTCompiledDartCode()) {
     FlutterEngineAOTDataSource source = {};
@@ -947,6 +976,17 @@ void fl_engine_notify_display_update(FlEngine* self,
                                      const FlutterEngineDisplay* displays,
                                      size_t displays_length) {
   g_return_if_fail(FL_IS_ENGINE(self));
+
+  // Draw at the rate of the fastest display, so animations are smooth on all
+  // of them.
+  double refresh_rate = 0.0;
+  for (size_t i = 0; i < displays_length; i++) {
+    refresh_rate = std::max(refresh_rate, displays[i].refresh_rate);
+  }
+  self->frame_interval = refresh_rate > 0.0
+                             ? static_cast<uint64_t>(std::llround(
+                                   kNanosecondsPerSecond / refresh_rate))
+                             : kDefaultFrameInterval;
 
   FlutterEngineResult result = self->embedder_api.NotifyDisplayUpdate(
       self->engine, kFlutterEngineDisplaysUpdateTypeStartup, displays,

@@ -121,7 +121,8 @@ FlutterEngineProcTable* fl_engine_get_embedder_api(FlEngine* engine);
  * @displays: displays present on the system.
  * @displays_length: length of @displays.
  *
- * Notify the current displays that are in the system.
+ * Notify the current displays that are in the system. Frames are drawn at the
+ * refresh rate of the fastest display.
  */
 void fl_engine_notify_display_update(FlEngine* engine,
                                      const FlutterEngineDisplay* displays,

@@ -72,6 +72,85 @@ TEST_F(FlEngineTest, NotifyDisplayUpdate) {
   EXPECT_TRUE(called);
 }
 
+// Checks frames start on a grid of the fastest display's refresh rate.
+TEST_F(FlEngineTest, Vsync) {
+  VsyncCallback vsync_callback = nullptr;
+  void* vsync_user_data = nullptr;
+  fl_engine_get_embedder_api(engine)->Initialize = MOCK_ENGINE_PROC(
+      Initialize, ([&vsync_callback, &vsync_user_data](
+                       size_t version, const FlutterRendererConfig* config,
+                       const FlutterProjectArgs* args, void* user_data,
+                       FLUTTER_API_SYMBOL(FlutterEngine)* engine_out) {
+        vsync_callback = args->vsync_callback;
+        vsync_user_data = user_data;
+        return kSuccess;
+      }));
+  fl_engine_get_embedder_api(engine)->RunInitialized =
+      MOCK_ENGINE_PROC(RunInitialized, ([](auto engine) { return kSuccess; }));
+  fl_engine_get_embedder_api(engine)->NotifyDisplayUpdate = MOCK_ENGINE_PROC(
+      NotifyDisplayUpdate,
+      ([](auto engine, FlutterEngineDisplaysUpdateType update_type,
+          const FlutterEngineDisplay* displays,
+          size_t displays_length) { return kSuccess; }));
+  StartEngine();
+  ASSERT_NE(vsync_callback, nullptr);
+
+  uint64_t now = 0;
+  fl_engine_get_embedder_api(engine)->GetCurrentTime =
+      MOCK_ENGINE_PROC(GetCurrentTime, ([&now]() { return now; }));
+  intptr_t vsync_baton = 0;
+  uint64_t frame_start = 0;
+  uint64_t frame_target = 0;
+  fl_engine_get_embedder_api(engine)->OnVsync = MOCK_ENGINE_PROC(
+      OnVsync, ([&vsync_baton, &frame_start, &frame_target](
+                    auto engine, intptr_t baton, uint64_t frame_start_nanos,
+                    uint64_t frame_target_nanos) {
+        vsync_baton = baton;
+        frame_start = frame_start_nanos;
+        frame_target = frame_target_nanos;
+        return kSuccess;
+      }));
+
+  // Without a known refresh rate, frames are drawn at 60 Hz.
+  constexpr uint64_t k60HzInterval = 16666667;
+  FlutterEngineDisplay unknown_display = {
+      .struct_size = sizeof(FlutterEngineDisplay),
+      .display_id = 1,
+      .refresh_rate = 0.0,
+  };
+  fl_engine_notify_display_update(engine, &unknown_display, 1);
+  now = 1;
+  vsync_callback(vsync_user_data, 42);
+  EXPECT_EQ(vsync_baton, 42);
+  EXPECT_EQ(frame_start, k60HzInterval);
+  EXPECT_EQ(frame_target, 2 * k60HzInterval);
+
+  // The fastest display sets the rate. A frame starts at the next refresh, or
+  // now if it is exactly on one.
+  constexpr uint64_t k120HzInterval = 8333333;
+  FlutterEngineDisplay displays[2] = {
+      {
+          .struct_size = sizeof(FlutterEngineDisplay),
+          .display_id = 1,
+          .refresh_rate = 60.0,
+      },
+      {
+          .struct_size = sizeof(FlutterEngineDisplay),
+          .display_id = 2,
+          .refresh_rate = 120.0,
+      }};
+  fl_engine_notify_display_update(engine, displays, 2);
+  now = 120 * k120HzInterval + 1;
+  vsync_callback(vsync_user_data, 43);
+  EXPECT_EQ(vsync_baton, 43);
+  EXPECT_EQ(frame_start, 121 * k120HzInterval);
+  EXPECT_EQ(frame_target, 122 * k120HzInterval);
+
+  now = 121 * k120HzInterval;
+  vsync_callback(vsync_user_data, 44);
+  EXPECT_EQ(frame_start, 121 * k120HzInterval);
+}
+
 // Checks asking the engine to render a frame works.
 TEST_F(FlEngineTest, ScheduleFrame) {
   StartEngine();
