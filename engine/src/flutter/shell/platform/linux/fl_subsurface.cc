@@ -48,6 +48,14 @@ FlSubsurface* fl_subsurface_new(struct wl_compositor* compositor,
   wl_surface_set_input_region(self->surface, input_region);
   wl_region_destroy(input_region);
 
+  // Hyprland only blurs the first surface it draws in a window or layer.
+  // FLUTTER_LINUX_SUBSURFACE_BELOW=1 stacks the subsurface below the parent
+  // surface so blur applies to the Flutter content. Only use it with a
+  // transparent view background, as the parent surface is drawn on top.
+  if (g_strcmp0(g_getenv("FLUTTER_LINUX_SUBSURFACE_BELOW"), "1") == 0) {
+    wl_subsurface_place_below(self->subsurface, parent_surface);
+  }
+
   return self;
 }
 

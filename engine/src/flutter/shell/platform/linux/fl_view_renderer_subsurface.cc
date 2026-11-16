@@ -129,6 +129,17 @@ static uint32_t get_surface_id(struct wl_surface* surface) {
              : wl_proxy_get_id(reinterpret_cast<struct wl_proxy*>(surface));
 }
 
+// Hyprland before 0.57 doesn't redraw a layer surface when only its
+// desynchronized subsurface commits. FLUTTER_LINUX_SUBSURFACE_SYNC=1 keeps the
+// subsurface synchronized instead and applies each frame with a commit of the
+// parent surface. Committing GTK's surface behind its back can crash GTK3 after
+// a while, so only use this where it's needed.
+static gboolean keep_synchronized() {
+  static const gboolean keep =
+      g_strcmp0(g_getenv("FLUTTER_LINUX_SUBSURFACE_SYNC"), "1") == 0;
+  return keep;
+}
+
 // Desynchronize the subsurface from the parent surface again, so frames are
 // shown as soon as they are presented. Any frame held back while synchronized
 // is shown now.
@@ -164,7 +175,7 @@ static void begin_synchronized_resize(FlViewRendererSubsurface* self) {
   // A view sized to its content keeps the subsurface synchronized, see
   // create_subsurface().
   if (self->subsurface == nullptr || self->synchronized ||
-      self->sized_to_content) {
+      self->sized_to_content || keep_synchronized()) {
     return;
   }
 
@@ -223,7 +234,7 @@ static void create_subsurface(FlViewRendererSubsurface* self,
   // and redraws the window for each one, see frame_presented_cb(). Otherwise
   // desynchronize it so frames are shown as soon as they are committed, which
   // leaves the GTK thread idle while Flutter is animating.
-  if (self->sized_to_content) {
+  if (self->sized_to_content || keep_synchronized()) {
     fl_subsurface_set_sync(self->subsurface);
   } else {
     fl_subsurface_set_desync(self->subsurface);
@@ -302,6 +313,13 @@ static gboolean frame_presented_cb(gpointer user_data) {
     // The subsurface is synchronized, so the frame is shown when the window
     // is next committed; redraw it to make that happen.
     gtk_widget_queue_draw(GTK_WIDGET(self));
+  } else if (keep_synchronized() && self->parent_surface != nullptr &&
+             !self->synchronized) {
+    // The frame is shown when the parent surface commits. Commit it without a
+    // new buffer rather than redrawing the window for every frame.
+    wl_surface_commit(self->parent_surface);
+    wl_display_flush(gdk_wayland_display_get_wl_display(
+        gtk_widget_get_display(GTK_WIDGET(self))));
   }
 
   return G_SOURCE_REMOVE;
